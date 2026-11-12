@@ -435,6 +435,84 @@ class _GroupSinks:
             raise first_error
 
 
+def _iter_record_pairs(
+    r1_stream: FastqStream, r2_stream: FastqStream
+) -> Iterable[tuple[RawRecord, RawRecord]]:
+    """Yield validated ``(r1_record, r2_record)`` pairs in file order.
+
+    Applies the pairing rules shared by demultiplexing and plain validation:
+    both streams must hold the same number of records and the read IDs of
+    each pair must match.  Reading one record past the last pair forces gzip
+    trailer validation on both streams.
+    """
+
+    pair_count = 0
+    while True:
+        next_pair = pair_count + 1
+        r1_record = r1_stream.read_record()
+        r2_record = r2_stream.read_record()
+
+        if r1_record is None or r2_record is None:
+            if r1_record is None and r2_record is None:
+                return
+
+            longer = "R1" if r1_record is not None else "R2"
+            next_line = pair_count * 4 + 1
+            # Both readers are positioned at the same four-line slot,
+            # whether they contain a record there or just hit EOF.
+            raise DemuxError(
+                "count_mismatch",
+                f"{longer} has an extra record at pair {next_pair}, but the "
+                f"other file ended after {pair_count} reads. R1 and R2 must "
+                "contain the same number of reads.",
+                file=longer,
+                record=next_pair,
+                line=next_line,
+                locations={
+                    "R1": {"record": next_pair, "line": next_line},
+                    "R2": {"record": next_pair, "line": next_line},
+                },
+            )
+
+        if r1_record.read_id != r2_record.read_id:
+            line_no = pair_count * 4 + 1
+            raise DemuxError(
+                "id_mismatch",
+                f"Read identifiers differ at pair {next_pair}: R1 has "
+                f"{r1_record.read_id!r}, R2 has {r2_record.read_id!r}.",
+                file="R1/R2",
+                record=next_pair,
+                line=line_no,
+                locations={
+                    "R1": {"record": next_pair, "line": line_no},
+                    "R2": {"record": next_pair, "line": line_no},
+                },
+            )
+
+        yield r1_record, r2_record
+        pair_count += 1
+
+
+def validate_paired_fastq(r1_fileobj: BinaryIO, r2_fileobj: BinaryIO) -> int:
+    """Fully read and validate a paired gzip FASTQ, returning the pair count.
+
+    Applies exactly the record, pairing, and gzip-trailer checks used by
+    :func:`prepare_package`, without writing any output.  Raises
+    :class:`DemuxError` on the first violation.
+    """
+
+    r1_stream = FastqStream(r1_fileobj, "R1")
+    r2_stream = FastqStream(r2_fileobj, "R2")
+    try:
+        pair_count = 0
+        for _r1_record, _r2_record in _iter_record_pairs(r1_stream, r2_stream):
+            pair_count += 1
+        return pair_count
+    finally:
+        r1_stream.close()
+        r2_stream.close()
+
+
 def _hamming_distance(left: bytes, right: bytes) -> int:
     return sum(a != b for a, b in zip(left, right))
 
@@ -537,48 +615,7 @@ def prepare_package(
         sinks = _GroupSinks(tmpdir, normalized)
 
         pair_count = 0
-        while True:
-            next_pair = pair_count + 1
-            r1_record = r1_stream.read_record()
-            r2_record = r2_stream.read_record()
-
-            if r1_record is None or r2_record is None:
-                if r1_record is None and r2_record is None:
-                    break
-
-                longer = "R1" if r1_record is not None else "R2"
-                next_line = pair_count * 4 + 1
-                # Both readers are positioned at the same four-line slot,
-                # whether they contain a record there or just hit EOF.
-                raise DemuxError(
-                    "count_mismatch",
-                    f"{longer} has an extra record at pair {next_pair}, but the "
-                    f"other file ended after {pair_count} reads. R1 and R2 must "
-                    "contain the same number of reads.",
-                    file=longer,
-                    record=next_pair,
-                    line=next_line,
-                    locations={
-                        "R1": {"record": next_pair, "line": next_line},
-                        "R2": {"record": next_pair, "line": next_line},
-                    },
-                )
-
-            if r1_record.read_id != r2_record.read_id:
-                line_no = pair_count * 4 + 1
-                raise DemuxError(
-                    "id_mismatch",
-                    f"Read identifiers differ at pair {next_pair}: R1 has "
-                    f"{r1_record.read_id!r}, R2 has {r2_record.read_id!r}.",
-                    file="R1/R2",
-                    record=next_pair,
-                    line=line_no,
-                    locations={
-                        "R1": {"record": next_pair, "line": line_no},
-                        "R2": {"record": next_pair, "line": line_no},
-                    },
-                )
-
+        for r1_record, r2_record in _iter_record_pairs(r1_stream, r2_stream):
             assert r1_record.observed_barcode is not None
             group_name = _classify(r1_record.observed_barcode, normalized)
             sinks.write_pair(group_name, r1_record, r2_record)

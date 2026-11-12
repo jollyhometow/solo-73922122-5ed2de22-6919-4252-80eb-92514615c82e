@@ -1,4 +1,24 @@
 services:
+  instrument:
+    build: ./instrument
+    image: demux-instrument-source:latest
+    ports:
+      - "${INSTRUMENT_PORT:-9000}:9000"
+    environment:
+      INSTRUMENT_PORT: 9000
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
   demux:
     build: .
     image: paired-end-demux:latest
@@ -6,7 +26,14 @@ services:
       - "${DEMUX_PORT:-8000}:8000"
     environment:
       DEMUX_TMP_ROOT: /tmp/demux
+      ACQ_DATA_DIR: /data
+      INSTRUMENT_BASE_URL: http://instrument:9000
       LOG_LEVEL: INFO
+    volumes:
+      - demux-data:/data
+    depends_on:
+      instrument:
+        condition: service_healthy
     restart: unless-stopped
     init: true
     healthcheck:
@@ -19,3 +46,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+volumes:
+  demux-data:

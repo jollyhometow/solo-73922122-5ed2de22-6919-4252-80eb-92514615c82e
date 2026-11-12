@@ -24,8 +24,10 @@ def rec(read_id: str, barcode: str | None, seq: str, mate: int) -> bytes:
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(main_module, "TMP_ROOT", tmp_path)
+    monkeypatch.setenv("ACQ_DATA_DIR", str(tmp_path_factory.mktemp("acq")))
+    monkeypatch.setenv("INSTRUMENT_BASE_URL", "http://127.0.0.1:9")
     with TestClient(main_module.app) as test_client:
         yield test_client
 

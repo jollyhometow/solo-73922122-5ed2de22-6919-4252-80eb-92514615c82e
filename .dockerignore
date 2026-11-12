@@ -6,6 +6,8 @@ __pycache__
 .pytest_cache
 tests
 examples
+instrument
+data
 README.md
 Dockerfile
 docker-compose.yml

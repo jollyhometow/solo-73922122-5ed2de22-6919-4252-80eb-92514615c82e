@@ -1,7 +1,13 @@
 # 双端 FASTQ 条码拆样服务
 
-一个用 FastAPI 实现的上传/拆样/下载服务：接收 R1、R2 两份 gzip FASTQ
-和最多 16 个唯一的 8 位 A/C/G/T 样本条码，流式拆分为样本包 ZIP。
+一个用 FastAPI 实现的服务，支持两条输入路径：
+
+1. **从仪器源采集 run**：测序中心数据员按 `run_id` 从配置固定的仪器导出
+   服务器拉取 R1/R2，断网、断流、进程重启后都能续传；两份文件都通过
+   SHA-256 摘要和 FASTQ 配对、gzip 校验后才标为可用，可用后即可拆样
+   下载样本 ZIP。
+2. **直接上传拆样**：接收 R1、R2 两份 gzip FASTQ 和最多 16 个唯一的
+   8 位 A/C/G/T 样本条码，流式拆分为样本包 ZIP。
 
 ## 快速启动
 
@@ -9,10 +15,20 @@
 docker compose up --build -d
 ```
 
-启动后打开 <http://localhost:8000/docs>。`/health` 用于健康检查。停止并清理：
+这会启动两个服务：
+
+| 服务 | 端口 | 说明 |
+|---|---|---|
+| `demux` | 8000 | 拆样 API，文档在 <http://localhost:8000/docs> |
+| `instrument` | 9000 | 本地仪器导出源，支持断流、换版、忽略 Range 三种故障注入 |
+
+`demux` 的采集数据（SQLite 清单/进度 + 分块暂存文件）保存在命名卷
+`demux-data`（容器内 `/data`），容器重启后进度保留。`/health` 用于健康
+检查。停止并清理：
 
 ```bash
-docker compose down
+docker compose down        # 保留数据卷
+docker compose down -v     # 连同采集数据一起删除
 ```
 
 也可以用本地 Python 启动（Python 3.11+）：
@@ -21,8 +37,151 @@ docker compose down
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-DEMUX_TMP_ROOT=/tmp/demux uvicorn app.main:app --host 0.0.0.0 --port 8000
+python3 instrument/server.py &                 # 仪器源，监听 9000
+ACQ_DATA_DIR=./data INSTRUMENT_BASE_URL=http://localhost:9000 \
+  uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+## 在 /docs 演示采集、续传和拆样
+
+仪器源内置了一个 `demo` run：前两次文件响应会在 40% 处断流，之后恢复
+正常，因此无需任何额外操作就能演示完整流程。
+
+1. **导入（被断流）**：打开 <http://localhost:8000/docs>，展开
+   `POST /api/runs/{run_id}/import`，Try it out，`run_id` 填 `demo`，
+   执行。响应 200，`state` 为 `incomplete`，`files[0].bytes_on_disk`
+   约为 `length` 的 40%，`last_error` 是 `transfer_interrupted`。
+2. **查询**：用 `GET /api/runs/{run_id}` 查看进度；也可以此时
+   `docker compose restart demux` 再查询——进度不变（重启后从落盘字节
+   恢复，SQLite 里的进度绝不超过实际落盘字节）。
+3. **续传（再次被断流）**：`POST /api/runs/{run_id}/resume`，
+   `run_id=demo`。R1 进度前进到约 64%，仍为 `incomplete`。续传请求
+   带 `Range: bytes=<已落盘>-` 和 `If-Match: <清单ETag>`。
+4. **续传（完成）**：再次 `resume`。两份文件下完后依次校验 SHA-256、
+   跑 FASTQ 配对 + gzip 校验，全部通过，`state` 变为 `usable`，
+   两份 `.part` 晋级为 `R1.fastq.gz` / `R2.fastq.gz`。
+5. **拆样**：`POST /api/runs/{run_id}/demux`，`run_id=demo`，
+   `barcodes` 填 `ACGTACGT` 和 `TTTTAAAA`，下载样本 ZIP。
+
+### 演示换版（源端版本变化）
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"cuts": 1}' http://localhost:9000/admin/runs/lab/behavior
+# /docs 中 import run_id=lab -> incomplete（断流）
+curl -X POST http://localhost:9000/admin/rotate     # 仪器源换版
+# /docs 中 resume run_id=lab -> 409 source_version_changed
+```
+
+`If-Match` 不再匹配，源返回 412，API 拒绝整批、清除暂存，run 标为
+`failed`；再次 `import` 会按新清单重新采集。
+
+### 演示忽略 Range
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"cuts": 1, "ignore_range": true}' \
+  http://localhost:9000/admin/runs/ignr/behavior
+# /docs 中 import run_id=ignr -> incomplete
+# /docs 中 resume run_id=ignr -> 源无视 Range 返回 200，
+#   API 将该文件截断从头覆盖（不追加），最终 usable
+```
+
+### 演示摘要不符
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"corrupt": true}' http://localhost:9000/admin/runs/evil/behavior
+# /docs 中 import run_id=evil -> 409 digest_mismatch，暂存被清除
+```
+
+仪器源管理接口（直接打 9000 端口）：
+
+| 接口 | 说明 |
+|---|---|
+| `GET /runs/{run_id}/manifest` | 清单：两文件路径、长度、强 ETag、SHA-256 |
+| `GET /runs/{run_id}/files/{R1\|R2}.fastq.gz` | 文件下载，支持 `Range`/`If-Match` |
+| `POST /admin/rotate` | 全局版本 +1，所有文件的 ETag/SHA-256/长度改变 |
+| `POST /admin/runs/{run_id}/behavior` | 设置故障：`{"cuts": n, "cut_fraction": f, "ignore_range": b, "corrupt": b}` |
+| `GET /admin/runs/{run_id}/behavior` | 查看该 run 的故障配置 |
+| `POST /admin/reset` | 版本归零、清空全部故障配置 |
+| `GET /admin/state` | 查看当前版本与全部故障配置 |
+
+## 采集 API
+
+所有采集接口都在 `INSTRUMENT_BASE_URL` 固定的源上操作；服务以**单 API
+进程**运行，同一 run 同一时间只允许一个采集，并发请求收到
+`409 acquisition_in_progress`。
+
+### `POST /api/runs/{run_id}/import`
+
+拉取源清单并冻结进 SQLite（两文件路径、长度、强 ETag、SHA-256，每份
+≤ 64 MiB，缺一项即 `502 invalid_manifest`），然后分块落盘到
+`runs/{run_id}/{R1,R2}.part`。结果：
+
+* 两份文件下完且校验通过 → `state=usable`；
+* 中途断流/源异常 → `state=incomplete`，前缀保留，可续传；
+* 源换版或摘要不符 → `409`，整批拒绝并清除暂存，`state=failed`。
+
+对已经 `usable` 的 run 重复 import 是幂等空操作；清单未变的
+`incomplete` run 重复 import 等于续传；清单变了（或之前失败）则清空
+暂存按新清单重采。
+
+### `POST /api/runs/{run_id}/resume`
+
+从落盘字节处续传：请求带 `Range: bytes=<offset>-` 和
+`If-Match: <冻结ETag>`。
+
+* `206`：核对响应 ETag 与冻结清单一致、`Content-Range` 起点等于本地
+  偏移、总长度等于清单长度，才追加写盘；
+* `200`（源忽略 Range）：ETag 核对一致后**从头覆盖**该文件，绝不追加；
+* `412` 或 ETag 变化：源换版 → 拒绝整批、清除暂存、`409`；
+* 连接中断：保留已落盘前缀，`state=incomplete`，可再次续传。
+
+两份文件都齐后：先逐份核对 SHA-256（不符 → 拒绝整批），再跑与上传
+接口相同的 FASTQ 配对 + gzip 校验（不符 → `502 source_data_invalid`，
+整批拒绝），全部通过才一起标为 `usable`。
+
+### `GET /api/runs/{run_id}` / `GET /api/runs`
+
+查询单个 run 或全部 run 的状态：每份文件的清单长度、已落盘字节、
+摘要是否通过、最近错误和时间戳。
+
+### `POST /api/runs/{run_id}/demux`
+
+仅 `usable` 的 run 可用（否则 `409 run_not_usable`）。表单字段
+`barcodes` 与上传接口相同，对落盘的两份文件执行同一套拆样逻辑，
+返回同样的样本 ZIP。
+
+### 状态机与错误码
+
+```text
+(无记录) --import--> incomplete --传输完成+校验通过--> usable
+                       |  ^-- resume/重启后续传            |
+                       |                                 (文件丢失 -> incomplete)
+                       +-- 换版/摘要不符/FASTQ无效 --> failed --import--> incomplete
+```
+
+采集相关 `detail.code`：`invalid_run_id`(422)、`run_not_found`(404)、
+`acquisition_in_progress`(409)、`run_failed`(409)、`run_not_usable`(409)、
+`source_version_changed`(409)、`digest_mismatch`(409)、
+`source_unavailable`(502)、`invalid_manifest`(502)、
+`source_data_invalid`(502)。断流不算错误响应：返回 200 且
+`state=incomplete`、`last_error.code=transfer_interrupted`。
+
+### 可靠性设计
+
+* **进度不超过落盘字节**：每写一块、flush 之后才更新 SQLite 进度；
+  启动时（及每次传输前）把进度钳制到 `.part` 实际大小，崩溃留下的
+  多余尾巴先截断再续传。
+* **暂存与晋级**：下载中的文件是 `runs/{run_id}/*.part`；两份都通过
+  摘要和 FASTQ/gzip 校验后，才原子改名为 `R1.fastq.gz`/`R2.fastq.gz`
+  并在同一事务里把 run 标为 `usable`，不会出现"半个可用 run"。
+* **整批拒绝**：换版、摘要不符、FASTQ 无效都会删除整个 run 的暂存
+  目录并把 run 标为 `failed`，只能重新 import。
+* **配置**：`INSTRUMENT_BASE_URL`（源地址，默认
+  `http://localhost:9000`）、`ACQ_DATA_DIR`（SQLite + 暂存目录，默认
+  `./data`，compose 中为 `/data` 卷）、`DEMUX_TMP_ROOT`（拆样临时目录）。
 
 ## 在 /docs 演示上传和下载
 
@@ -69,7 +228,7 @@ curl -sS -D headers.txt \
 python3 examples/generate_examples.py
 ```
 
-## API
+## 拆样规则
 
 ### `POST /api/demux`
 
@@ -156,6 +315,8 @@ R1/R2 gzip；0 条组是合法的空 gzip，便于下游脚本统一处理。
 * 清理：构建失败时立即删除本请求临时目录；下载正常结束、写响应失败或
   客户端断开时，响应生成器的 `finally` 和幂等后台清理都会删除临时目录；
   上传 spool 文件也随即关闭。`DemuxPackage` 还有析构兜底。
+* 采集：按传输块落盘，内存只有当前块；进度和清单在 SQLite，暂存文件
+  在 `ACQ_DATA_DIR`，进程重启后原样续传。
 
 临时目录默认 `/tmp/demux`，可用环境变量 `DEMUX_TMP_ROOT` 修改。
 
@@ -166,8 +327,10 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-核心测试只用标准库；API 测试需要 FastAPI/httpx。当前仓库附带的
-`tests/test_demux.py` 也可不装依赖直接运行：
+核心测试只用标准库；API 测试需要 FastAPI/httpx。采集测试
+（`tests/test_acquisition.py`）自带一个可控的仪器源桩，覆盖断流续传、
+换版拒绝、忽略 Range 覆盖重下、摘要不符、进度与落盘一致性等场景。
+当前仓库附带的 `tests/test_demux.py` 也可不装依赖直接运行：
 
 ```bash
 python3 -m unittest tests.test_demux -v

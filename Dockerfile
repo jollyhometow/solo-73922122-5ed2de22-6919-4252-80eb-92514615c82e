@@ -3,7 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    DEMUX_TMP_ROOT=/tmp/demux
+    DEMUX_TMP_ROOT=/tmp/demux \
+    ACQ_DATA_DIR=/data
 
 WORKDIR /app
 
@@ -13,11 +14,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin demux \
-    && mkdir -p /tmp/demux \
-    && chown demux:demux /tmp/demux
+    && mkdir -p /tmp/demux /data \
+    && chown demux:demux /tmp/demux /data
 
 USER demux
 
 EXPOSE 8000
 
+# Single worker on purpose: acquisition state lives in this process.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
